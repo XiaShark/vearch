@@ -66,7 +66,7 @@ GammaIVFPQIndex::~GammaIVFPQIndex() {
 
 faiss::InvertedListScanner *GammaIVFPQIndex::GetInvertedListScanner(
     bool store_pairs, const faiss::IDSelector *sel, const faiss::IVFSearchParameters*,
-    const RetrievalContext *retrieval_context) {
+    const SearchCondition *retrieval_context) {
   return faiss::with_simd_level([&]<faiss::SIMDLevel SL>() -> faiss::InvertedListScanner* {
       auto make =
               [&]<class PQCodeDist, bool use_sel>() -> faiss::InvertedListScanner* {
@@ -595,7 +595,7 @@ int GammaIVFPQIndex::Search(RetrievalContext *retrieval_context, int n,
   quantizer->search(n, applied_xq, nprobe, coarse_dis.get(), idx.get());
   this->invlists->prefetch_lists(idx.get(), n * nprobe);
 
-  search_preassigned(retrieval_context, n, xq, applied_xq, k, idx.get(),
+  search_preassigned(condition, n, xq, applied_xq, k, idx.get(),
                      coarse_dis.get(), distances, labels, nprobe, false);
   if (RequestContext::is_killed()) {
     return -2;
@@ -728,7 +728,7 @@ void compute_dis(int k, const float *xi, float *simi, idx_t *idxi,
 }  // namespace
 
 void GammaIVFPQIndex::search_preassigned(
-    RetrievalContext *retrieval_context, int n, const float *x,
+    SearchCondition *retrieval_context, int n, const float *x,
     const float *applied_x, int k, const idx_t *keys, const float *coarse_dis,
     float *distances, idx_t *labels, int nprobe, bool store_pairs,
     const faiss::IVFSearchParameters *params) {

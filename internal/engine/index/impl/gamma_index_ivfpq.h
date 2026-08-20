@@ -787,7 +787,7 @@ struct GammaIVFPQScanner : IVFPQScannerT<idx_t, METRIC_TYPE, PQCodeDist>,
   int precompute_mode;
   const faiss::IDSelector *sel;
   bool store_pairs;
-  const RetrievalContext *retrieval_context_;
+  const SearchCondition *retrieval_context_;
   const GammaIVFPQIndex &gamma_ivfpq_;
 
   GammaIVFPQScanner(
@@ -795,7 +795,7 @@ struct GammaIVFPQScanner : IVFPQScannerT<idx_t, METRIC_TYPE, PQCodeDist>,
       bool store_pairs_in,
       int precompute_mode_in,
       const faiss::IDSelector *sel_in,
-      const RetrievalContext *retrieval_context_in)
+      const SearchCondition *retrieval_context_in)
       : IVFPQScannerT<idx_t, METRIC_TYPE, PQCodeDist>(gamma_ivfpq, nullptr),
         precompute_mode(precompute_mode_in),
         sel(sel_in),
@@ -1262,7 +1262,7 @@ struct GammaIVFPQIndex : GammaFLATIndex, faiss::IndexIVFPQ {
 
   faiss::InvertedListScanner *GetInvertedListScanner(
       bool store_pairs, const faiss::IDSelector *sel,
-      const faiss::IVFSearchParameters*, const RetrievalContext *retrieval_context);
+      const faiss::IVFSearchParameters*, const SearchCondition *retrieval_context);
 
   Status Init(const std::string &model_parameters,
               int training_threshold) override;
@@ -1280,7 +1280,7 @@ struct GammaIVFPQIndex : GammaFLATIndex, faiss::IndexIVFPQ {
   int Search(RetrievalContext *retrieval_context, int n, const uint8_t *x,
              int k, float *distances, idx_t *labels) override;
 
-  void search_preassigned(RetrievalContext *retrieval_context, int n,
+  void search_preassigned(SearchCondition *retrieval_context, int n,
                           const float *x, const float *applied_x, int k,
                           const idx_t *keys, const float *coarse_dis,
                           float *distances, idx_t *labels, int nprobe,

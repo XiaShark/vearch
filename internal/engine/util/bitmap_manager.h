@@ -40,7 +40,12 @@ class BitmapManager {
 
   virtual int Unset(int64_t bit_id);
 
-  virtual bool Test(int64_t bit_id);
+  virtual bool Test(int64_t bit_id) final {
+    if (bit_id >= 0 && bit_id < size_ && bitmap_ != nullptr) {
+      return (bitmap_[bit_id >> 3] & (0x1 << (bit_id & 0x7)));
+    }
+    return false;
+  }
 
   virtual int64_t BitSize() { return size_; }
 
@@ -83,8 +88,6 @@ class RocksdbBitmapManager : public BitmapManager {
   virtual int Set(int64_t bit_id);
 
   virtual int Unset(int64_t bit_id);
-
-  virtual bool Test(int64_t bit_id);
 
   virtual int SetMaxID(int64_t bit_id);
 

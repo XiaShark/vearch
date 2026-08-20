@@ -197,13 +197,6 @@ int BitmapManager::Unset(int64_t bit_id) {
   return -1;
 }
 
-bool BitmapManager::Test(int64_t bit_id) {
-  if (bit_id >= 0 && bit_id < size_ && bitmap_ != nullptr) {
-    return (bitmap_[bit_id >> 3] & (0x1 << (bit_id & 0x7)));
-  }
-  return false;
-}
-
 int BitmapManager::SetMaxID(int64_t bit_id) {
   if (size_ > bit_id) return 0;
 
@@ -443,13 +436,6 @@ int RocksdbBitmapManager::Unset(int64_t bit_id) {
     return 0;
   }
   return -1;
-}
-
-bool RocksdbBitmapManager::Test(int64_t bit_id) {
-  if (bit_id >= 0 && bit_id < size_ && bitmap_ != nullptr) {
-    return (bitmap_[bit_id >> 3] & (0x1 << (bit_id & 0x7)));
-  }
-  return false;
 }
 
 void FreeOldSharedPtr(std::shared_ptr<char[]> temp) { temp.reset(); }

@@ -95,7 +95,7 @@ class SearchCondition : public RetrievalContext {
     return (score <= max_score) && (score >= min_score);
   };
 
-  bool IsValid(int64_t id) const override {
+  bool IsValid(int64_t id) const final {
 #ifndef FAISSLIKE_INDEX
     if ((scalar_index_result != nullptr && not scalar_index_result->Has(id)) ||
         docids_bitmap->Test(id)) {
