@@ -924,6 +924,7 @@ struct GammaIVFPQScanner : IVFPQScannerT<idx_t, METRIC_TYPE, PQCodeDist>,
   void scan_list_with_table(size_t ncode, const uint8_t *codes,
                             SearchResultType &res) const {
     constexpr size_t kBatchSize = 4;
+    using ScalarPQCodeDist = faiss::PQCodeDistanceScalar<PQDecoder>;
     size_t pending_indices[kBatchSize];
     const uint8_t *pending_codes[kBatchSize];
     size_t pending_count = 0;
@@ -940,7 +941,7 @@ struct GammaIVFPQScanner : IVFPQScannerT<idx_t, METRIC_TYPE, PQCodeDist>,
       float distance_1;
       float distance_2;
       float distance_3;
-      PQCodeDist::distance_four_codes(
+      ScalarPQCodeDist::distance_four_codes(
           this->pq.M, this->pq.nbits, this->sim_table, pending_codes[0],
           pending_codes[1], pending_codes[2], pending_codes[3], distance_0,
           distance_1, distance_2, distance_3);
@@ -954,7 +955,7 @@ struct GammaIVFPQScanner : IVFPQScannerT<idx_t, METRIC_TYPE, PQCodeDist>,
 
     auto scan_pending = [&]() {
       for (size_t i = 0; i < pending_count; i++) {
-        const float pq_distance = PQCodeDist::distance_single_code(
+        const float pq_distance = ScalarPQCodeDist::distance_single_code(
             this->pq.M, this->pq.nbits, this->sim_table, pending_codes[i]);
         add_result(pending_indices[i], pq_distance);
       }
