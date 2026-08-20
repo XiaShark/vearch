@@ -17,7 +17,7 @@ BUILD_GAMMA_OPT_LEVEL=avx512
 # version value
 BUILD_VERSION="latest"
 
-while getopts ":n:g:tdh" opt; do
+while getopts ":n:g:o:tdh" opt; do
   case $opt in
   n)
     COMPILE_THREAD_NUM="-j"$OPTARG
@@ -46,7 +46,7 @@ while getopts ":n:g:tdh" opt; do
     echo -e "\t-g\t\tbuild gamma or not: [ON|OFF]"
     echo -e "\t-t\t\tbuild gamma test"
     echo -e "\t-d\t\tbuild gamma type=Debug"
-    echo -e "\t-o\t\tbuild gamma opt level=[generic|avx2|avx512]"
+    echo -e "\t-o\t\tbuild gamma opt level=[generic|avx2|avx512|sve]"
     exit 0
     ;;
   ?)

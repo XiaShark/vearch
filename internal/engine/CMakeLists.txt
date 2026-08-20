@@ -18,8 +18,9 @@ option(BUILD_FAISSLIKE_INDEX "Build faisslike index" off)
 option(BUILD_RELAYOUT "Build relayout index" off)
 option(ENABLE_COVERAGE "Use gcov" off)
 option(BUILD_PYTHON_SDK "Build python sdk" off)
-# Valid values are "generic", "avx2", "avx512"
-option(BUILD_GAMMA_OPT_LEVEL "Build opt level" "avx2")
+# Valid values are "generic", "avx2", "avx512", "sve"
+set(BUILD_GAMMA_OPT_LEVEL "avx2" CACHE STRING "Build opt level")
+set_property(CACHE BUILD_GAMMA_OPT_LEVEL PROPERTY STRINGS generic avx2 avx512 sve)
 
 #ENV VARs
 set(THIRDPARTY ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
@@ -79,7 +80,8 @@ if(APPLE)
                      "/usr/local/opt/openblas/lib")
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM|aarch64|AARCH64")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM|aarch64|AARCH64" AND
+   NOT BUILD_GAMMA_OPT_LEVEL STREQUAL "sve")
     set(BUILD_GAMMA_OPT_LEVEL "generic")
 endif()
 
@@ -133,6 +135,14 @@ set(LIB_SRCS ${ALL_SOURCES} ${RELAYOUT_SRCS})
 
 if(NOT BUILD_WITH_GPU)
     add_library(gamma SHARED ${LIB_SRCS})
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM|aarch64|AARCH64" AND
+       BUILD_GAMMA_OPT_LEVEL STREQUAL "sve")
+        # Gamma uses Faiss private dispatch headers, so it must see the same
+        # compile-time SIMD levels as the statically linked Faiss library.
+        target_compile_definitions(gamma PRIVATE
+            COMPILE_SIMD_ARM_NEON
+            COMPILE_SIMD_ARM_SVE)
+    endif()
 
     add_library(gamma_avx2 SHARED ${LIB_SRCS})
     if(NOT BUILD_GAMMA_OPT_LEVEL STREQUAL "avx2" AND NOT BUILD_GAMMA_OPT_LEVEL STREQUAL "avx512")
@@ -163,6 +173,7 @@ set(COMMON_LIBRARIES
     -lzstd
     -lprotobuf
     -lroaring
+    -lz
 )
 
 set(COMMON_LIBRARIES_AVX2
@@ -208,7 +219,8 @@ if (MKL_FOUND)
     elseif(BUILD_GAMMA_OPT_LEVEL STREQUAL "avx2")
         list(APPEND COMMON_LIBRARIES_AVX2 ${MKL_LIBRARIES})
         list(APPEND COMMON_LIBRARIES ${MKL_LIBRARIES})
-    elseif(BUILD_GAMMA_OPT_LEVEL STREQUAL "generic")
+    elseif(BUILD_GAMMA_OPT_LEVEL STREQUAL "generic" OR
+           BUILD_GAMMA_OPT_LEVEL STREQUAL "sve")
         list(APPEND COMMON_LIBRARIES ${MKL_LIBRARIES})
     endif()
 else()
@@ -219,13 +231,18 @@ else()
     elseif(BUILD_GAMMA_OPT_LEVEL STREQUAL "avx2")
         list(APPEND COMMON_LIBRARIES_AVX2 -lopenblas)
         list(APPEND COMMON_LIBRARIES -lopenblas)
-    elseif(BUILD_GAMMA_OPT_LEVEL STREQUAL "generic")
+    elseif(BUILD_GAMMA_OPT_LEVEL STREQUAL "generic" OR
+           BUILD_GAMMA_OPT_LEVEL STREQUAL "sve")
         list(APPEND COMMON_LIBRARIES -lopenblas)
     endif()
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM|aarch64|AARCH64")
-    list(APPEND COMMON_LIBRARIES -lfaiss)
+    if(BUILD_GAMMA_OPT_LEVEL STREQUAL "sve")
+        list(APPEND COMMON_LIBRARIES -lfaiss_sve)
+    else()
+        list(APPEND COMMON_LIBRARIES -lfaiss)
+    endif()
 else()
     if(BUILD_GAMMA_OPT_LEVEL STREQUAL "avx512")
         list(APPEND COMMON_LIBRARIES_AVX512 -lfaiss_avx512)
@@ -313,6 +330,12 @@ if(BUILD_WITH_GPU)
     list(FILTER LIB_SRCS EXCLUDE REGEX "${GAMMA_GPU}/.*\\.(cc|cpp|cu)$")
 
     add_library(gamma SHARED ${LIB_SRCS} ${GAMMA_GPU_SOURCES})
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM|aarch64|AARCH64" AND
+       BUILD_GAMMA_OPT_LEVEL STREQUAL "sve")
+        target_compile_definitions(gamma PRIVATE
+            COMPILE_SIMD_ARM_NEON
+            COMPILE_SIMD_ARM_SVE)
+    endif()
 
     target_include_directories(gamma
         PRIVATE
