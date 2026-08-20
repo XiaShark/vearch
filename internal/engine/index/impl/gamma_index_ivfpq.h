@@ -923,33 +923,69 @@ struct GammaIVFPQScanner : IVFPQScannerT<idx_t, METRIC_TYPE, PQCodeDist>,
   template <class SearchResultType>
   void scan_list_with_table(size_t ncode, const uint8_t *codes,
                             SearchResultType &res) const {
+    constexpr size_t kBatchSize = 4;
+    size_t pending_indices[kBatchSize];
+    const uint8_t *pending_codes[kBatchSize];
+    size_t pending_count = 0;
+
+    auto add_result = [&](size_t j, float pq_distance) {
+      const float distance = this->dis0 + pq_distance;
+      if (retrieval_context_->IsSimilarScoreValid(distance)) {
+        res.add(j, distance);
+      }
+    };
+
+    auto scan_batch = [&]() {
+      float distance_0;
+      float distance_1;
+      float distance_2;
+      float distance_3;
+      PQCodeDist::distance_four_codes(
+          this->pq.M, this->pq.nbits, this->sim_table, pending_codes[0],
+          pending_codes[1], pending_codes[2], pending_codes[3], distance_0,
+          distance_1, distance_2, distance_3);
+
+      add_result(pending_indices[0], distance_0);
+      add_result(pending_indices[1], distance_1);
+      add_result(pending_indices[2], distance_2);
+      add_result(pending_indices[3], distance_3);
+      pending_count = 0;
+    };
+
+    auto scan_pending = [&]() {
+      for (size_t i = 0; i < pending_count; i++) {
+        const float pq_distance = PQCodeDist::distance_single_code(
+            this->pq.M, this->pq.nbits, this->sim_table, pending_codes[i]);
+        add_result(pending_indices[i], pq_distance);
+      }
+      pending_count = 0;
+    };
+
+    const size_t code_size = this->pq.code_size;
     for (size_t j = 0; j < ncode; j++) {
       if (RequestContext::is_killed_every<1024>(j)) {
         return;
       }
-      if (res.ids[j] & realtime::kDelIdxMask) {
-        codes += this->pq.code_size;
+
+      const idx_t stored_id = res.ids[j];
+      if (stored_id & realtime::kDelIdxMask) {
         continue;
       }
 
-      if (!retrieval_context_->IsValid(res.ids[j] &
+      if (!retrieval_context_->IsValid(stored_id &
                                        realtime::kRecoverIdxMask)) {
-        codes += this->pq.code_size;
         continue;
       }
-      PQDecoder decoder(codes, this->pq.nbits);
-      codes += this->pq.code_size;
-      float dis = this->dis0;
-      const float *tab = this->sim_table;
 
-      for (size_t m = 0; m < this->pq.M; m++) {
-        dis += tab[decoder.decode()];
-        tab += this->pq.ksub;
-      }
-      if (retrieval_context_->IsSimilarScoreValid(dis)) {
-        res.add(j, dis);
+      pending_indices[pending_count] = j;
+      pending_codes[pending_count] = codes + j * code_size;
+      pending_count++;
+      if (pending_count == kBatchSize) {
+        scan_batch();
       }
     }
+
+    scan_pending();
   }
 
   size_t scan_codes(
