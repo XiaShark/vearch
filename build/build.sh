@@ -8,7 +8,7 @@ mkdir -p $BUILDOUT $LIBOUT
 GAMMAOUT=$ROOT/build/gamma_build
 
 # BUILD OPTS
-COMPILE_THREAD_NUM=-j4
+COMPILE_THREAD_NUM=-j8
 BUILD_GAMMA=ON
 BUILD_GAMMA_TEST=OFF
 BUILD_GAMMA_TYPE=Release
@@ -118,6 +118,14 @@ function build_engine() {
   else
     local rpath="\$ORIGIN"
   fi
+  cmake_opts+=(
+    -DCMAKE_C_COMPILER=clang
+    -DCMAKE_CXX_COMPILER=clang++
+    -DCMAKE_C_FLAGS="-flto=thin -g"
+    -DCMAKE_CXX_FLAGS="-flto=thin -g"
+    -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -flto=thin"
+    -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -flto=thin"
+  )
   cmake "${cmake_opts[@]}" -DCMAKE_BUILD_RPATH="$rpath" -DCMAKE_INSTALL_RPATH="\$ORIGIN" -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF $ROOT/internal/engine/
   make $COMPILE_THREAD_NUM
   popd
