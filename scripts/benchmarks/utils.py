@@ -627,6 +627,10 @@ def get_dataset_by_name(logger: logging, args: argparse.Namespace):
             ncentroids = int(args.nb / 39 / args.partition_num)
     nprobe = 80 if ncentroids > 80 else ncentroids // 2
 
+    if args.dataset == "sift" and args.index_type == "IVFPQ":
+        ncentroids = 256
+        nprobe = 10
+
     args.nq = dataset.get_queries().shape[0]
     params = {
         "metric_type": dataset.metric,

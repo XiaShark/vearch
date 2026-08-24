@@ -31,6 +31,22 @@ from utils import parse_arguments, get_dataset_by_name, evaluate, load_config
 __description__ = """ benchmark for restful api"""
 
 
+DOCUMENT_TIMEOUT_MS = 1000000
+HTTP_CONNECT_TIMEOUT_SECONDS = 10
+HTTP_RESPONSE_TIMEOUT_SECONDS = DOCUMENT_TIMEOUT_MS / 1000 + 10
+UPSERT_MAX_ATTEMPTS = 5
+UPSERT_RETRYABLE_STATUS_CODES = {502, 503, 504}
+_document_session = None
+
+
+def _get_document_session():
+    """Return one persistent HTTP session per multiprocessing worker."""
+    global _document_session
+    if _document_session is None:
+        _document_session = requests.Session()
+    return _document_session
+
+
 def create_db(args: argparse.Namespace):
     url = f"{args.url}/dbs/" + args.db
     resp = requests.post(url, auth=(args.user, args.password))
@@ -67,6 +83,17 @@ def destroy(args: argparse.Namespace):
 
 
 def create_db_and_space(args: argparse.Namespace):
+    index_params = args.index_params
+    if args.index_type in ("IVFFLAT", "IVFPQ"):
+        # Vearch trains an IVF index independently on every partition.  The
+        # engine default is ncentroids * 200, which is 800,000 for SIFT1M's
+        # default ncentroids=4,000.  With three partitions each partition only
+        # receives about 333,333 vectors, so training would never start.
+        index_params = dict(args.index_params)
+        index_params.setdefault(
+            "training_threshold", index_params["ncentroids"] * 39
+        )
+
     properties = {}
     if args.index_params != "":
         properties["fields"] = [
@@ -85,7 +112,7 @@ def create_db_and_space(args: argparse.Namespace):
                 "index": {
                     "name": "gamma",
                     "type": args.index_type,
-                    "params": args.index_params,
+                    "params": index_params,
                 },
                 "dimension": args.dimension,
             },
@@ -129,40 +156,75 @@ def create_db_and_space(args: argparse.Namespace):
     assert response.json()["code"] == 0
 
 
+def _get_space_data(args: argparse.Namespace):
+    """Return space metadata, checking both HTTP and Vearch API status."""
+    url = args.url + "/dbs/" + args.db + "/spaces/" + args.space
+    response = requests.get(url, auth=(args.user, args.password), timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("code") != 0:
+        raise RuntimeError("get space status failed: %s" % payload)
+    return payload.get("data", {})
+
+
 def waiting_train_finish(args: argparse.Namespace, timewait: int = 5):
     if args.index_type == "FLAT" or args.index_type == "HNSW":
         return
-    url = args.url + "/dbs/" + args.db + "/spaces/" + args.space
-    num = 0
-
-    while num < args.partition_num:
-        num = 0
-        response = requests.get(url, auth=(args.user, args.password))
-        partitions = response.json()["data"]["partitions"]
-        for p in partitions:
-            num += p["index_status"]
-        logger.debug("index status: %d" % (num))
+    # A real SIFT1M build normally finishes well below this limit.  Keep a
+    # finite bound so an API/status mismatch cannot leave the benchmark stuck
+    # forever.
+    deadline = time.time() + 3600
+    last_log = 0
+    while True:
+        space_data = _get_space_data(args)
+        partitions = space_data.get("partitions", [])
+        statuses = [p.get("index_status", 0) for p in partitions]
+        if len(statuses) == args.partition_num and all(
+            status == 2 for status in statuses
+        ):
+            return
+        if time.time() >= deadline:
+            raise TimeoutError(
+                "index training did not finish within the timeout; "
+                "partition statuses=%s" % statuses
+            )
+        if time.time() - last_log >= 30:
+            logger.info("waiting for index training: statuses=%s", statuses)
+            last_log = time.time()
         time.sleep(timewait)
 
 
 def waiting_index_finish(args: argparse.Namespace, timewait: int = 5):
     if args.index_type == "FLAT":
         return
-    url = args.url + "/dbs/" + args.db + "/spaces/" + args.space
-    num = 0
-    while num < args.nb:
-        num = 0
-        response = requests.get(url, auth=(args.user, args.password))
-        partitions = response.json()["data"]["partitions"]
-        for p in partitions:
-            num += p["index_num"]
-        logger.debug("index num: %d" % (num))
+    deadline = time.time() + 3600
+    last_log = 0
+    while True:
+        space_data = _get_space_data(args)
+        partitions = space_data.get("partitions", [])
+        index_nums = [p.get("index_num", 0) for p in partitions]
+        num = sum(index_nums)
+        if num >= args.nb:
+            return
+        if time.time() >= deadline:
+            raise TimeoutError(
+                "index build did not finish within the timeout; "
+                "indexed=%d/%d partitions=%s" % (num, args.nb, index_nums)
+            )
+        if time.time() - last_log >= 30:
+            logger.info(
+                "waiting for index build: indexed=%d/%d partitions=%s",
+                num,
+                args.nb,
+                index_nums,
+            )
+            last_log = time.time()
         time.sleep(timewait)
 
 
 def process_upsert_data(items: tuple):
     args, index, size, features = items
-    url = args.url + "/document/upsert"
+    url = args.url + f"/document/upsert?timeout={DOCUMENT_TIMEOUT_MS}"
     data = {}
     data["db_name"] = args.db
     data["space_name"] = args.space
@@ -183,12 +245,52 @@ def process_upsert_data(items: tuple):
         param_dict["field_string"] = str(param_dict["field_int"])
         data["documents"].append(param_dict)
 
-    rs = requests.post(url, auth=(args.user, args.password), json=data)
-    if rs.json()["code"] != 0:
-        logger.error(rs.json())
-    if rs.json()["data"]["total"] != size:
-        logger.debug(rs.json())
-    assert rs.json()["data"]["total"] == size
+    for attempt in range(1, UPSERT_MAX_ATTEMPTS + 1):
+        error = None
+        try:
+            rs = _get_document_session().post(
+                url,
+                auth=(args.user, args.password),
+                json=data,
+                timeout=(
+                    HTTP_CONNECT_TIMEOUT_SECONDS,
+                    HTTP_RESPONSE_TIMEOUT_SECONDS,
+                ),
+            )
+            rs.raise_for_status()
+            payload = rs.json()
+            if payload.get("code") != 0:
+                raise RuntimeError("upsert failed: %s" % payload)
+            total = payload.get("data", {}).get("total")
+            if total != size:
+                raise RuntimeError(
+                    "upsert returned total=%r, expected=%d: %s"
+                    % (total, size, payload)
+                )
+            return
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            retryable = True
+            error = exc
+        except requests.HTTPError as exc:
+            retryable = (
+                exc.response is not None
+                and exc.response.status_code in UPSERT_RETRYABLE_STATUS_CODES
+            )
+            error = exc
+
+        if not retryable or attempt == UPSERT_MAX_ATTEMPTS:
+            raise error
+
+        delay = min(0.25 * (2 ** (attempt - 1)), 4.0)
+        logger.warning(
+            "upsert batch %d failed on attempt %d/%d (%s); retrying in %.2fs",
+            index,
+            attempt,
+            UPSERT_MAX_ATTEMPTS,
+            error,
+            delay,
+        )
+        time.sleep(delay)
 
 
 def upsert(args: argparse.Namespace, xb: np.ndarray = None):
@@ -286,14 +388,19 @@ def train_and_build_index(args: argparse.Namespace):
 
 def process_query_data(items: tuple):
     args, unique_keys = items
-    url = args.url + "/document/query"
+    url = args.url + f"/document/query?timeout={DOCUMENT_TIMEOUT_MS}"
     data = {}
     data["db_name"] = args.db
     data["space_name"] = args.space
     data["document_ids"] = unique_keys
     data["vector_value"] = args.vector_value
 
-    rs = requests.post(url, auth=(args.user, args.password), json=data)
+    rs = _get_document_session().post(
+        url,
+        auth=(args.user, args.password),
+        json=data,
+        timeout=(HTTP_CONNECT_TIMEOUT_SECONDS, HTTP_RESPONSE_TIMEOUT_SECONDS),
+    )
     if rs.json()["code"] != 0:
         logger.error(rs.json())
     if len(rs.json()["data"]["documents"]) != args.batch_size:
@@ -334,13 +441,18 @@ def query(args: argparse.Namespace):
 
 def process_delete_data(items: tuple):
     args, unique_keys = items
-    url = args.url + "/document/delete"
+    url = args.url + f"/document/delete?timeout={DOCUMENT_TIMEOUT_MS}"
     data = {}
     data["db_name"] = args.db
     data["space_name"] = args.space
     data["document_ids"] = unique_keys
 
-    rs = requests.post(url, auth=(args.user, args.password), json=data)
+    rs = _get_document_session().post(
+        url,
+        auth=(args.user, args.password),
+        json=data,
+        timeout=(HTTP_CONNECT_TIMEOUT_SECONDS, HTTP_RESPONSE_TIMEOUT_SECONDS),
+    )
     if rs.json()["code"] != 0:
         logger.error(rs.json())
     if rs.json()["data"]["total"] != args.batch_size:
@@ -380,26 +492,37 @@ def delete(args: argparse.Namespace):
 
 def process_search_data(items: tuple):
     args, index, features = items
-    url = args.url + "/document/search?timeout=1000000"
+    url = args.url + f"/document/search?timeout={DOCUMENT_TIMEOUT_MS}"
     if args.trace:
-        url = args.url + "/document/search?timeout=1000000&trace=true"
+        url = (
+            args.url
+            + f"/document/search?timeout={DOCUMENT_TIMEOUT_MS}&trace=true"
+        )
     data = {}
     data["db_name"] = args.db
     data["space_name"] = args.space
     data["vectors"] = [{"field": "field_vector", "feature": features}]
     data["limit"] = args.limit
 
-    rs = requests.post(url, auth=(args.user, args.password), json=data)
-    if rs.json()["code"] != 0:
-        logger.error(rs.json())
-    if len(rs.json()["data"]["documents"]) != args.batch_size:
+    rs = _get_document_session().post(
+        url,
+        auth=(args.user, args.password),
+        json=data,
+        timeout=(HTTP_CONNECT_TIMEOUT_SECONDS, HTTP_RESPONSE_TIMEOUT_SECONDS),
+    )
+    rs.raise_for_status()
+    payload = rs.json()
+    if payload.get("code") != 0:
+        raise RuntimeError("search failed: %s" % payload)
+    documents = payload.get("data", {}).get("documents", [])
+    if len(documents) != args.batch_size:
         logger.error(
             "search result length should be %d, but is %d"
-            % (args.batch_size, len(rs.json()["data"]["documents"]))
+            % (args.batch_size, len(documents))
         )
-    assert len(rs.json()["data"]["documents"]) == args.batch_size
+    assert len(documents) == args.batch_size
 
-    return index, rs.json()["data"]["documents"]
+    return index, documents
 
 
 def search(args: argparse.Namespace, xq: np.ndarray, gt: np.ndarray):

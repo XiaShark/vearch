@@ -151,29 +151,52 @@ def create_db_and_space(args: argparse.Namespace):
 def waiting_train_finish(args: argparse.Namespace, timewait: int = 5):
     if args.index_type == "FLAT" or args.index_type == "HNSW":
         return
-    num = 0
-
-    while num < args.partition_num:
-        num = 0
+    deadline = time.time() + 3600
+    last_log = 0
+    while True:
         _, space, _ = vc.is_space_exist(args.db, args.space)
         partitions = space.data["partitions"]
-        for p in partitions:
-            num += p["index_status"]
-        logger.debug("index status: %d" % (num))
+        statuses = [p.get("index_status", 0) for p in partitions]
+        if len(statuses) == args.partition_num and all(
+            status == 2 for status in statuses
+        ):
+            return
+        if time.time() >= deadline:
+            raise TimeoutError(
+                "index training did not finish within the timeout; "
+                "partition statuses=%s" % statuses
+            )
+        if time.time() - last_log >= 30:
+            logger.info("waiting for index training: statuses=%s", statuses)
+            last_log = time.time()
         time.sleep(timewait)
 
 
 def waiting_index_finish(args: argparse.Namespace, timewait: int = 5):
     if args.index_type == "FLAT":
         return
-    num = 0
-    while num < args.nb:
-        num = 0
+    deadline = time.time() + 3600
+    last_log = 0
+    while True:
         _, space, _ = vc.is_space_exist(args.db, args.space)
         partitions = space.data["partitions"]
-        for p in partitions:
-            num += p["index_num"]
-        logger.debug("index num: %d" % (num))
+        index_nums = [p.get("index_num", 0) for p in partitions]
+        num = sum(index_nums)
+        if num >= args.nb:
+            return
+        if time.time() >= deadline:
+            raise TimeoutError(
+                "index build did not finish within the timeout; "
+                "indexed=%d/%d partitions=%s" % (num, args.nb, index_nums)
+            )
+        if time.time() - last_log >= 30:
+            logger.info(
+                "waiting for index build: indexed=%d/%d partitions=%s",
+                num,
+                args.nb,
+                index_nums,
+            )
+            last_log = time.time()
         time.sleep(timewait)
 
 
