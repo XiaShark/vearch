@@ -18,7 +18,8 @@ The test creates and populates its own space before measuring search.  Setup
 and index construction are deliberately outside the measurement window.  The
 benchmark accepts the same common ``VEARCH_PERF_*`` settings as the IVFPQ
 benchmark, with ``VEARCH_HNSW_PERF_*`` taking precedence for HNSW-specific
-settings.
+settings. ``VEARCH_HNSW_PERF_TRUST_ENV`` controls whether Requests reads proxy
+and CA-related environment variables (default: ``false``).
 """
 
 import json
@@ -75,6 +76,16 @@ def _env_csv(name, default):
     return [item for item in values if item]
 
 
+def _env_bool(name, default=False):
+    value = _env(name, default)
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError("%s must be a boolean, got %r" % (name, value))
+
+
 QUERY_COUNT = _env_int("QUERY_COUNT", 100, minimum=1)
 TOP_K = _env_int("TOP_K", 100, minimum=1)
 INGEST_BATCH_SIZE = _env_int("INGEST_BATCH_SIZE", 100, minimum=1)
@@ -88,6 +99,7 @@ REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 120, minimum=0.1
 NLINKS = _env_int("NLINKS", 32, minimum=1)
 EF_CONSTRUCTION = _env_int("EF_CONSTRUCTION", 200, minimum=1)
 EF_SEARCH = _env_int("EF_SEARCH", 64)
+TRUST_ENV = _env_bool("TRUST_ENV")
 MODES = _env_csv("MODES", "single,batch")
 CONCURRENCIES = [int(value) for value in _env_csv("CONCURRENCY", "1")]
 
@@ -218,13 +230,40 @@ def _request_specs(mode, query_vectors, base_query):
 
 
 def _new_session():
-    session = requests.Session()
+    session = _TimedSession()
+    # The benchmark targets the local Router. Requests otherwise scans the
+    # process environment for proxy settings on every request, adding
+    # serialized Python/GIL work to the closed-loop client measurement.
+    session.trust_env = TRUST_ENV
+    session.mount("http://", _TimedHTTPAdapter())
+    session.mount("https://", _TimedHTTPAdapter())
     session.auth = (username, password)
     session.headers.update({"Content-Type": "application/json"})
     return session
 
 
-def _execute_search(session, body, expected_query_count):
+class _TimedSession(requests.Session):
+    """Session using an adapter that measures the HTTP exchange."""
+
+    def send(self, request, **kwargs):
+        response = super().send(request, **kwargs)
+        started = getattr(response, "_vearch_http_started", None)
+        if started is not None:
+            response._vearch_http_elapsed = time.perf_counter() - started
+        return response
+
+
+class _TimedHTTPAdapter(requests.adapters.HTTPAdapter):
+    """Mark the point immediately before Requests enters urllib3."""
+
+    def send(self, request, **kwargs):
+        started = time.perf_counter()
+        response = super().send(request, **kwargs)
+        response._vearch_http_started = started
+        return response
+
+
+def _execute_search(session, body, expected_query_count, return_latency=False):
     response = session.post(
         router_url + "/document/search?timeout=2000000",
         data=body,
@@ -237,6 +276,8 @@ def _execute_search(session, body, expected_query_count):
             "search returned %s query result groups, expected %d"
             % (len(documents) if isinstance(documents, list) else None, expected_query_count)
         )
+    if return_latency:
+        return documents, response._vearch_http_elapsed
     return documents
 
 
@@ -296,15 +337,19 @@ def _run_trial(request_specs, concurrency):
             if not warmup_failed:
                 while time.perf_counter() < state["deadline"]:
                     body, expected = request_specs[request_index % len(request_specs)]
-                    started = time.perf_counter()
                     try:
-                        _execute_search(session, body, expected)
+                        _, http_elapsed = _execute_search(
+                            session,
+                            body,
+                            expected,
+                            return_latency=True,
+                        )
                     except Exception as error:
                         errors += 1
                         if len(error_examples) < 3:
                             error_examples.append("%s: %s" % (type(error).__name__, error))
                     else:
-                        latencies_ms.append((time.perf_counter() - started) * 1000.0)
+                        latencies_ms.append(http_elapsed * 1000.0)
                     request_index += concurrency
         return {
             "latencies_ms": latencies_ms,
@@ -404,7 +449,8 @@ def test_vearch_index_hnsw_performance():
     logger.info(
         "PERF CONFIG index=HNSW vectors=%d dimension=%d queries=%d top_k=%d "
         "modes=%s concurrency=%s warmup_rounds=%d trials=%d seconds=%.1f "
-        "nlinks=%d efConstruction=%d efSearch=%s",
+        "nlinks=%d efConstruction=%d efSearch=%s latency_scope=http_send "
+        "trust_env=%s",
         vectors.shape[0],
         vectors.shape[1],
         query_count,
@@ -417,6 +463,7 @@ def test_vearch_index_hnsw_performance():
         NLINKS,
         EF_CONSTRUCTION,
         "server-default" if EF_SEARCH < 0 else EF_SEARCH,
+        str(TRUST_ENV).lower(),
     )
 
     database_created = False

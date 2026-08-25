@@ -17,6 +17,8 @@
 The database, ingestion, and IVFFLAT training steps are excluded from search
 measurements.  Common ``VEARCH_PERF_*`` settings are supported, while
 ``VEARCH_IVFFLAT_PERF_*`` values take precedence for this index.
+``VEARCH_IVFFLAT_PERF_TRUST_ENV`` controls whether Requests reads proxy and
+CA-related environment variables (default: ``false``).
 """
 
 import json
@@ -71,6 +73,16 @@ def _env_csv(name, default):
     return [item.strip() for item in _env(name, default).split(",") if item.strip()]
 
 
+def _env_bool(name, default=False):
+    value = _env(name, default)
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError("%s must be a boolean, got %r" % (name, value))
+
+
 QUERY_COUNT = _env_int("QUERY_COUNT", 100, minimum=1)
 TOP_K = _env_int("TOP_K", 100, minimum=1)
 INGEST_BATCH_SIZE = _env_int("INGEST_BATCH_SIZE", 100, minimum=1)
@@ -83,6 +95,7 @@ INDEX_POLL_SECONDS = _env_float("INDEX_POLL_SECONDS", 2, minimum=0.1)
 REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 120, minimum=0.1)
 NCENTROIDS = _env_int("NCENTROIDS", 256, minimum=1)
 NPROBE = _env_int("NPROBE", 10)
+TRUST_ENV = _env_bool("TRUST_ENV")
 TRAINING_THRESHOLD = _env_int("TRAINING_THRESHOLD", NCENTROIDS * 39, minimum=1)
 MODES = _env_csv("MODES", "single,batch")
 CONCURRENCIES = [int(value) for value in _env_csv("CONCURRENCY", "1")]
@@ -219,13 +232,40 @@ def _request_specs(mode, query_vectors, base_query):
 
 
 def _new_session():
-    session = requests.Session()
+    session = _TimedSession()
+    # The benchmark targets the local Router. Requests otherwise scans the
+    # process environment for proxy settings on every request, adding
+    # serialized Python/GIL work to the closed-loop client measurement.
+    session.trust_env = TRUST_ENV
+    session.mount("http://", _TimedHTTPAdapter())
+    session.mount("https://", _TimedHTTPAdapter())
     session.auth = (username, password)
     session.headers.update({"Content-Type": "application/json"})
     return session
 
 
-def _execute_search(session, body, expected_query_count):
+class _TimedSession(requests.Session):
+    """Session using an adapter that measures the HTTP exchange."""
+
+    def send(self, request, **kwargs):
+        response = super().send(request, **kwargs)
+        started = getattr(response, "_vearch_http_started", None)
+        if started is not None:
+            response._vearch_http_elapsed = time.perf_counter() - started
+        return response
+
+
+class _TimedHTTPAdapter(requests.adapters.HTTPAdapter):
+    """Mark the point immediately before Requests enters urllib3."""
+
+    def send(self, request, **kwargs):
+        started = time.perf_counter()
+        response = super().send(request, **kwargs)
+        response._vearch_http_started = started
+        return response
+
+
+def _execute_search(session, body, expected_query_count, return_latency=False):
     response = session.post(
         router_url + "/document/search?timeout=2000000",
         data=body,
@@ -238,6 +278,8 @@ def _execute_search(session, body, expected_query_count):
             "search returned %s query result groups, expected %d"
             % (len(documents) if isinstance(documents, list) else None, expected_query_count)
         )
+    if return_latency:
+        return documents, response._vearch_http_elapsed
     return documents
 
 
@@ -297,15 +339,19 @@ def _run_trial(request_specs, concurrency):
             if not warmup_failed:
                 while time.perf_counter() < state["deadline"]:
                     body, expected = request_specs[request_index % len(request_specs)]
-                    started = time.perf_counter()
                     try:
-                        _execute_search(session, body, expected)
+                        _, http_elapsed = _execute_search(
+                            session,
+                            body,
+                            expected,
+                            return_latency=True,
+                        )
                     except Exception as error:
                         errors += 1
                         if len(error_examples) < 3:
                             error_examples.append("%s: %s" % (type(error).__name__, error))
                     else:
-                        latencies_ms.append((time.perf_counter() - started) * 1000.0)
+                        latencies_ms.append(http_elapsed * 1000.0)
                     request_index += concurrency
         return {
             "latencies_ms": latencies_ms,
@@ -405,7 +451,8 @@ def test_vearch_index_ivfflat_performance():
     logger.info(
         "PERF CONFIG index=IVFFLAT vectors=%d dimension=%d queries=%d top_k=%d "
         "modes=%s concurrency=%s warmup_rounds=%d trials=%d seconds=%.1f "
-        "ncentroids=%d nprobe=%s training_threshold=%d",
+        "ncentroids=%d nprobe=%s training_threshold=%d "
+        "latency_scope=http_send trust_env=%s",
         vectors.shape[0],
         vectors.shape[1],
         query_count,
@@ -418,6 +465,7 @@ def test_vearch_index_ivfflat_performance():
         NCENTROIDS,
         "server-default" if NPROBE < 0 else NPROBE,
         TRAINING_THRESHOLD,
+        str(TRUST_ENV).lower(),
     )
 
     database_created = False
