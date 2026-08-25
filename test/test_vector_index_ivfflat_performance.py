@@ -306,6 +306,46 @@ def _verify_recall(batch_spec, groundtruth):
     )
 
 
+def _run_warmup(request_specs, concurrency):
+    """Run the configured warmup passes once before the measurement trials."""
+    def worker(worker_id):
+        errors = 0
+        error_examples = []
+        with _new_session() as session:
+            warmup_failed = False
+            for _ in range(WARMUP_ROUNDS):
+                for offset in range(len(request_specs)):
+                    body, expected = request_specs[(worker_id + offset) % len(request_specs)]
+                    try:
+                        _execute_search(session, body, expected)
+                    except Exception as error:
+                        errors += 1
+                        if len(error_examples) < 3:
+                            error_examples.append(
+                                "warmup: %s: %s" % (type(error).__name__, error)
+                            )
+                        warmup_failed = True
+                        break
+                if warmup_failed:
+                    break
+        return errors, error_examples
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [
+            executor.submit(worker, worker_id)
+            for worker_id in range(concurrency)
+        ]
+        worker_results = [future.result() for future in futures]
+    return {
+        "errors": sum(errors for errors, _ in worker_results),
+        "error_examples": [
+            error
+            for _, examples in worker_results
+            for error in examples
+        ][:3],
+    }
+
+
 def _run_trial(request_specs, concurrency):
     state = {}
 
@@ -318,45 +358,29 @@ def _run_trial(request_specs, concurrency):
     def worker(worker_id):
         latencies_ms = []
         errors = 0
-        warmup_errors = 0
         error_examples = []
         request_index = worker_id
         with _new_session() as session:
-            warmup_failed = False
-            for _ in range(WARMUP_ROUNDS):
-                for offset in range(len(request_specs)):
-                    body, expected = request_specs[(worker_id + offset) % len(request_specs)]
-                    try:
-                        _execute_search(session, body, expected)
-                    except Exception as error:
-                        warmup_errors += 1
-                        error_examples.append("warmup: %s: %s" % (type(error).__name__, error))
-                        warmup_failed = True
-                        break
-                if warmup_failed:
-                    break
             barrier.wait()
-            if not warmup_failed:
-                while time.perf_counter() < state["deadline"]:
-                    body, expected = request_specs[request_index % len(request_specs)]
-                    try:
-                        _, http_elapsed = _execute_search(
-                            session,
-                            body,
-                            expected,
-                            return_latency=True,
-                        )
-                    except Exception as error:
-                        errors += 1
-                        if len(error_examples) < 3:
-                            error_examples.append("%s: %s" % (type(error).__name__, error))
-                    else:
-                        latencies_ms.append(http_elapsed * 1000.0)
-                    request_index += concurrency
+            while time.perf_counter() < state["deadline"]:
+                body, expected = request_specs[request_index % len(request_specs)]
+                try:
+                    _, http_elapsed = _execute_search(
+                        session,
+                        body,
+                        expected,
+                        return_latency=True,
+                    )
+                except Exception as error:
+                    errors += 1
+                    if len(error_examples) < 3:
+                        error_examples.append("%s: %s" % (type(error).__name__, error))
+                else:
+                    latencies_ms.append(http_elapsed * 1000.0)
+                request_index += concurrency
         return {
             "latencies_ms": latencies_ms,
             "errors": errors,
-            "warmup_errors": warmup_errors,
             "error_examples": error_examples,
             "finished": time.perf_counter(),
         }
@@ -368,7 +392,6 @@ def _run_trial(request_specs, concurrency):
     elapsed = max(result["finished"] for result in worker_results) - state["start"]
     latencies_ms = [latency for result in worker_results for latency in result["latencies_ms"]]
     errors = sum(result["errors"] for result in worker_results)
-    warmup_errors = sum(result["warmup_errors"] for result in worker_results)
     error_examples = [
         error for result in worker_results for error in result["error_examples"]
     ][:3]
@@ -379,7 +402,6 @@ def _run_trial(request_specs, concurrency):
         "elapsed": elapsed,
         "successes": successes,
         "errors": errors,
-        "warmup_errors": warmup_errors,
         "error_rate": errors * 100.0 / attempts if attempts else 100.0,
         "error_examples": error_examples,
     }
@@ -486,6 +508,13 @@ def test_vearch_index_ivfflat_performance():
             specs = batch_specs if mode == "batch" else _request_specs(mode, query_vectors, base_query)
             vectors_per_request = query_count if mode == "batch" else 1
             for concurrency in CONCURRENCIES:
+                warmup_result = _run_warmup(specs, concurrency)
+                if warmup_result["error_examples"]:
+                    logger.error(
+                        "benchmark warmup error examples: %s",
+                        warmup_result["error_examples"],
+                    )
+                assert warmup_result["errors"] == 0
                 trial_results = []
                 trial_qps = []
                 for trial_number in range(1, TRIALS + 1):
@@ -494,7 +523,6 @@ def test_vearch_index_ivfflat_performance():
                     trial_qps.append(_log_trial(mode, concurrency, trial_number, result, vectors_per_request))
                     if result["error_examples"]:
                         logger.error("benchmark error examples: %s", result["error_examples"])
-                    assert result["warmup_errors"] == 0
                     assert result["errors"] == 0
                     assert result["successes"] > 0
                 _log_summary(mode, concurrency, trial_results, trial_qps)
