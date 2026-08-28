@@ -137,6 +137,11 @@ if(NOT BUILD_WITH_GPU)
     add_library(gamma SHARED ${LIB_SRCS})
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM|aarch64|AARCH64" AND
        BUILD_GAMMA_OPT_LEVEL STREQUAL "sve")
+        # The SVE build is deployed only on SVE-capable ARM hosts.  Enable the
+        # ISA for all Gamma sources so ordinary loops can be auto-vectorized;
+        # the COMPILE_SIMD_* definitions only control Faiss header dispatch.
+        target_compile_options(gamma PRIVATE
+            $<$<OR:$<COMPILE_LANGUAGE:CXX>,$<COMPILE_LANGUAGE:C>>:-march=armv8.2-a+sve>)
         # Gamma uses Faiss private dispatch headers, so it must see the same
         # compile-time SIMD levels as the statically linked Faiss library.
         target_compile_definitions(gamma PRIVATE
@@ -332,6 +337,8 @@ if(BUILD_WITH_GPU)
     add_library(gamma SHARED ${LIB_SRCS} ${GAMMA_GPU_SOURCES})
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM|aarch64|AARCH64" AND
        BUILD_GAMMA_OPT_LEVEL STREQUAL "sve")
+        target_compile_options(gamma PRIVATE
+            $<$<OR:$<COMPILE_LANGUAGE:CXX>,$<COMPILE_LANGUAGE:C>>:-march=armv8.2-a+sve>)
         target_compile_definitions(gamma PRIVATE
             COMPILE_SIMD_ARM_NEON
             COMPILE_SIMD_ARM_SVE)
