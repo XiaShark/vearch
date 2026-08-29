@@ -121,8 +121,8 @@ function build_engine() {
   cmake_opts+=(
     -DCMAKE_C_COMPILER=clang
     -DCMAKE_CXX_COMPILER=clang++
-    -DCMAKE_C_FLAGS="-flto=thin -g"
-    -DCMAKE_CXX_FLAGS="-flto=thin -g"
+    -DCMAKE_C_FLAGS="-flto=thin -g -ffast-math"
+    -DCMAKE_CXX_FLAGS="-flto=thin -g -ffast-math"
     -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -flto=thin"
     -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -flto=thin"
   )
