@@ -14,12 +14,16 @@
 
 """Client-side throughput benchmark for a Vearch HNSW index.
 
-The test creates and populates its own space before measuring search.  Setup
-and index construction are deliberately outside the measurement window.  The
-benchmark accepts the same common ``VEARCH_PERF_*`` settings as the IVFPQ
-benchmark, with ``VEARCH_HNSW_PERF_*`` taking precedence for HNSW-specific
-settings. ``VEARCH_HNSW_PERF_TRUST_ENV`` controls whether Requests reads proxy
-and CA-related environment variables (default: ``false``).
+By default, the test creates and populates its own space before measuring
+search. Setup and index construction are deliberately outside the measurement
+window. The benchmark accepts the same common ``VEARCH_PERF_*`` settings as
+the IVFPQ benchmark, with ``VEARCH_HNSW_PERF_*`` taking precedence for
+HNSW-specific settings. ``VEARCH_HNSW_PERF_TRUST_ENV`` controls whether
+Requests reads proxy and CA-related environment variables (default: ``false``).
+Set ``VEARCH_HNSW_PERF_KEEP_INDEX=true`` on the first run to flush and retain
+the created space, then use ``VEARCH_HNSW_PERF_REUSE_INDEX=true`` with the same
+explicit database and space names to benchmark that saved index without
+rebuilding it.
 """
 
 import json
@@ -37,6 +41,7 @@ from utils.vearch_utils import (
     create_db,
     create_space,
     destroy,
+    index_flush,
     logger,
     password,
     router_url,
@@ -95,11 +100,15 @@ MEASURE_SECONDS = _env_float("SECONDS", 30, minimum=0.1)
 SETTLE_SECONDS = _env_float("SETTLE_SECONDS", 10, minimum=0)
 INDEX_TIMEOUT_SECONDS = _env_float("INDEX_TIMEOUT_SECONDS", 1800, minimum=1)
 INDEX_POLL_SECONDS = _env_float("INDEX_POLL_SECONDS", 2, minimum=0.1)
+READY_CONSECUTIVE_POLLS = _env_int("READY_CONSECUTIVE_POLLS", 2, minimum=1)
 REQUEST_TIMEOUT_SECONDS = _env_float("REQUEST_TIMEOUT_SECONDS", 120, minimum=0.1)
 NLINKS = _env_int("NLINKS", 32, minimum=1)
 EF_CONSTRUCTION = _env_int("EF_CONSTRUCTION", 200, minimum=1)
 EF_SEARCH = _env_int("EF_SEARCH", 64)
 TRUST_ENV = _env_bool("TRUST_ENV")
+REUSE_INDEX = _env_bool("REUSE_INDEX")
+KEEP_INDEX = _env_bool("KEEP_INDEX")
+REUSE_WARMUP_SECONDS = _env_float("REUSE_WARMUP_SECONDS", 30, minimum=0)
 MODES = _env_csv("MODES", "single,batch")
 CONCURRENCIES = [int(value) for value in _env_csv("CONCURRENCY", "1")]
 
@@ -159,8 +168,10 @@ def _ingest(db_name, space_name, vectors):
             full_batches,
             INGEST_BATCH_SIZE,
             vectors[: full_batches * INGEST_BATCH_SIZE],
+            with_id=True,
             db_name=db_name,
             space_name=space_name,
+            max_workers=1,
         )
     if remainder:
         offset = full_batches * INGEST_BATCH_SIZE
@@ -168,15 +179,30 @@ def _ingest(db_name, space_name, vectors):
             remainder,
             1,
             vectors[offset:],
+            with_id=True,
             db_name=db_name,
             space_name=space_name,
             offset=offset,
+            max_workers=1,
         )
 
 
-def _wait_for_index(db_name, space_name, expected_count):
+def _wait_for_index(
+    db_name,
+    space_name,
+    expected_count,
+    require_complete_at_start=False,
+):
+    """Wait for one fully searchable partition.
+
+    In reuse mode a live partition with all documents but only a partial index
+    means Vearch is rebuilding after restart, not reusing the flushed graph.
+    Reject that state instead of silently benchmarking a different graph.
+    """
     url = "%s/dbs/%s/spaces/%s" % (router_url, db_name, space_name)
     deadline = time.perf_counter() + INDEX_TIMEOUT_SECONDS
+    ready_polls = 0
+    last_state = "no response"
     with requests.Session() as session:
         session.auth = (username, password)
         while True:
@@ -184,19 +210,175 @@ def _wait_for_index(db_name, space_name, expected_count):
                 session.get(url, timeout=REQUEST_TIMEOUT_SECONDS),
                 "get index status",
             )
+            partitions = payload.get("data", {}).get("partitions", [])
             indexed_count = sum(
-                partition.get("index_num", 0)
-                for partition in payload["data"]["partitions"]
+                partition.get("index_num", 0) for partition in partitions
             )
-            if indexed_count >= expected_count:
-                return
+            document_count = sum(
+                partition.get("doc_num", 0) for partition in partitions
+            )
+            partition_statuses = [
+                partition.get("status", 0) for partition in partitions
+            ]
+            index_statuses = [
+                partition.get("index_status", 0) for partition in partitions
+            ]
+            colors = [partition.get("color", "") for partition in partitions]
+            last_state = (
+                "partitions=%d documents=%d indexed=%d "
+                "partition_status=%s index_status=%s color=%s"
+                % (
+                    len(partitions),
+                    document_count,
+                    indexed_count,
+                    partition_statuses,
+                    index_statuses,
+                    colors,
+                )
+            )
+
+            partition_recovered = (
+                len(partitions) == 1
+                and partition_statuses[0] in (3, 4)  # PA_READONLY/PA_READWRITE
+            )
+            partition_live = (
+                partition_recovered
+                and partition_statuses == [4]  # entity.PA_READWRITE
+                and colors == ["green"]
+            )
+            if require_complete_at_start and partition_recovered:
+                if document_count != expected_count:
+                    raise AssertionError(
+                        "reusable space document count mismatch after restart: "
+                        "%s expected=%d" % (last_state, expected_count)
+                    )
+                if indexed_count != expected_count:
+                    raise AssertionError(
+                        "retained HNSW dump is incomplete after restart; refusing "
+                        "to benchmark a graph rebuilt during REUSE_INDEX: %s expected=%d"
+                        % (last_state, expected_count)
+                    )
+
+            ready = (
+                partition_live
+                and document_count == expected_count
+                and indexed_count == expected_count
+                and index_statuses == [2]  # INDEXED
+            )
+            if ready:
+                ready_polls += 1
+                if ready_polls >= READY_CONSECUTIVE_POLLS:
+                    logger.info("index ready: %s", last_state)
+                    return
+            else:
+                ready_polls = 0
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 raise TimeoutError(
-                    "index did not become ready in %.1fs: indexed=%d expected=%d"
-                    % (INDEX_TIMEOUT_SECONDS, indexed_count, expected_count)
+                    "index did not become ready in %.1fs: %s expected=%d"
+                    % (INDEX_TIMEOUT_SECONDS, last_state, expected_count)
                 )
             time.sleep(min(INDEX_POLL_SECONDS, remaining))
+
+
+def _flush_retained_index(db_name, space_name):
+    """Synchronously flush every shard and reject partial shard failures."""
+    payload = _assert_api_ok(
+        index_flush(router_url, db_name, space_name),
+        "flush retained index",
+    )
+    shards = payload.get("data", {}).get("_shards")
+    if not isinstance(shards, dict):
+        raise AssertionError(
+            "flush retained index returned no shard status: %s" % payload
+        )
+    total = shards.get("total")
+    successful = shards.get("successful")
+    # SearchStatus uses protobuf/JSON zero-value omission, so a successful
+    # response commonly has no explicit "failed": 0 field.
+    failed = shards.get("failed", 0)
+    if total != 1 or successful != total or failed != 0:
+        raise AssertionError("flush retained index failed: %s" % shards)
+    logger.info("retained index flush confirmed: %s", shards)
+
+
+def _validate_reusable_space(
+    db_name,
+    space_name,
+    expected_count,
+    expected_dimension,
+    expected_metric,
+    expected_nlinks,
+    expected_ef_construction,
+):
+    """Ensure a retained space is the exact dataset/index shape we expect."""
+    url = "%s/dbs/%s/spaces/%s" % (router_url, db_name, space_name)
+    with requests.Session() as session:
+        session.auth = (username, password)
+        payload = _assert_api_ok(
+            session.get(url, timeout=REQUEST_TIMEOUT_SECONDS),
+            "describe reusable space",
+        )
+
+    data = payload.get("data", {})
+    partitions = data.get("partitions", [])
+    if len(partitions) != 1:
+        raise AssertionError(
+            "reusable space must have exactly one partition, got %d"
+            % len(partitions)
+        )
+    indexed_count = sum(partition.get("index_num", 0) for partition in partitions)
+    if indexed_count != expected_count:
+        raise AssertionError(
+            "reusable space vector count mismatch: indexed=%d expected=%d"
+            % (indexed_count, expected_count)
+        )
+    if all("doc_num" in partition for partition in partitions):
+        document_count = sum(partition["doc_num"] for partition in partitions)
+        if document_count != expected_count:
+            raise AssertionError(
+                "reusable space document count mismatch: documents=%d expected=%d"
+                % (document_count, expected_count)
+            )
+
+    fields = data.get("schema", {}).get("fields", [])
+    vector_field = next(
+        (field for field in fields if field.get("name") == "field_vector"),
+        None,
+    )
+    if vector_field is None:
+        raise AssertionError("reusable space is missing field_vector")
+    if vector_field.get("dimension") != expected_dimension:
+        raise AssertionError(
+            "reusable space dimension mismatch: actual=%s expected=%d"
+            % (vector_field.get("dimension"), expected_dimension)
+        )
+
+    index = vector_field.get("index", {})
+    if index.get("type") != "HNSW":
+        raise AssertionError(
+            "reusable space index type mismatch: actual=%s expected=HNSW"
+            % index.get("type")
+        )
+    params = index.get("params", {})
+    metric = params.get("metric_type", "L2")
+    if str(metric).casefold() != expected_metric.casefold():
+        raise AssertionError(
+            "reusable space metric mismatch: actual=%s expected=%s"
+            % (metric, expected_metric)
+        )
+    if params.get("nlinks", 32) != expected_nlinks:
+        raise AssertionError(
+            "reusable space nlinks mismatch: actual=%s expected=%d"
+            % (params.get("nlinks", 32), expected_nlinks)
+        )
+    if params.get("efConstruction", 100) != expected_ef_construction:
+        raise AssertionError(
+            "reusable space efConstruction mismatch: actual=%s expected=%d"
+            % (params.get("efConstruction", 100), expected_ef_construction)
+        )
+
+    return data
 
 
 def _base_query(db_name, space_name, metric_type):
@@ -240,6 +422,12 @@ def _new_session():
     session.auth = (username, password)
     session.headers.update({"Content-Type": "application/json"})
     return session
+
+
+def _preconnect(session):
+    """Establish this session's Router connection outside the trial window."""
+    response = session.get(router_url + "/", timeout=REQUEST_TIMEOUT_SECONDS)
+    _assert_api_ok(response, "preconnect to Router")
 
 
 class _TimedSession(requests.Session):
@@ -300,20 +488,32 @@ def _verify_recall(batch_spec, groundtruth):
         recall_at *= 10
     logger.info(
         "correctness check: %s",
-        ", ".join("recall@%d=%.2f%%" % (key, value * 100) for key, value in recalls.items()),
+        ", ".join(
+            "recall@%d=%.2f%%" % (key, value * 100)
+            for key, value in recalls.items()
+        ),
     )
 
 
-def _run_warmup(request_specs, concurrency):
-    """Run the configured warmup passes once before the measurement trials."""
+def _run_warmup(request_specs, concurrency, minimum_seconds=0):
+    """Warm until both the configured round and duration targets are met."""
     def worker(worker_id):
         errors = 0
         error_examples = []
+        successes = 0
+        completed_rounds = 0
+        started = time.perf_counter()
+        deadline = started + minimum_seconds
         with _new_session() as session:
             warmup_failed = False
-            for _ in range(WARMUP_ROUNDS):
+            while (
+                completed_rounds < WARMUP_ROUNDS
+                or time.perf_counter() < deadline
+            ):
                 for offset in range(len(request_specs)):
-                    body, expected = request_specs[(worker_id + offset) % len(request_specs)]
+                    body, expected = request_specs[
+                        (worker_id + offset) % len(request_specs)
+                    ]
                     try:
                         _execute_search(session, body, expected)
                     except Exception as error:
@@ -324,9 +524,19 @@ def _run_warmup(request_specs, concurrency):
                             )
                         warmup_failed = True
                         break
+                    else:
+                        successes += 1
                 if warmup_failed:
                     break
-        return errors, error_examples
+                completed_rounds += 1
+        return {
+            "errors": errors,
+            "error_examples": error_examples,
+            "successes": successes,
+            "rounds": completed_rounds,
+            "finished": time.perf_counter(),
+            "started": started,
+        }
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [
@@ -335,12 +545,16 @@ def _run_warmup(request_specs, concurrency):
         ]
         worker_results = [future.result() for future in futures]
     return {
-        "errors": sum(errors for errors, _ in worker_results),
+        "errors": sum(result["errors"] for result in worker_results),
         "error_examples": [
             error
-            for _, examples in worker_results
-            for error in examples
+            for result in worker_results
+            for error in result["error_examples"]
         ][:3],
+        "successes": sum(result["successes"] for result in worker_results),
+        "rounds": min(result["rounds"] for result in worker_results),
+        "elapsed": max(result["finished"] for result in worker_results)
+        - min(result["started"] for result in worker_results),
     }
 
 
@@ -359,7 +573,14 @@ def _run_trial(request_specs, concurrency):
         error_examples = []
         request_index = worker_id
         with _new_session() as session:
-            barrier.wait()
+            try:
+                _preconnect(session)
+                barrier.wait()
+            except BaseException:
+                # Do not leave the other workers or the coordinator blocked if
+                # establishing one worker's connection fails.
+                barrier.abort()
+                raise
             while time.perf_counter() < state["deadline"]:
                 body, expected = request_specs[request_index % len(request_specs)]
                 try:
@@ -444,9 +665,17 @@ def _log_trial(mode, concurrency, trial_number, result, vectors_per_request):
 def _log_summary(mode, concurrency, trial_results, vector_qps):
     latencies = [latency for result in trial_results for latency in result["latencies_ms"]]
     stats = _latency_stats(latencies)
+    qps_values = np.asarray(vector_qps, dtype=np.float64)
+    qps_mean = float(np.mean(qps_values))
+    qps_stddev = (
+        float(np.std(qps_values, ddof=1)) if qps_values.size > 1 else 0.0
+    )
+    qps_cv = qps_stddev * 100.0 / qps_mean if qps_mean else float("nan")
     logger.info(
         "PERF SUMMARY mode=%s concurrency=%d trials=%d samples=%d "
-        "latency_ms(avg/p50/p95/p99)=%.2f/%.2f/%.2f/%.2f median_vector_qps=%.2f",
+        "latency_ms(avg/p50/p95/p99)=%.2f/%.2f/%.2f/%.2f "
+        "median_vector_qps=%.2f vector_qps_range(min/max)=%.2f/%.2f "
+        "vector_qps_cv=%.2f%%",
         mode,
         concurrency,
         len(trial_results),
@@ -455,26 +684,46 @@ def _log_summary(mode, concurrency, trial_results, vector_qps):
         stats["p50"],
         stats["p95"],
         stats["p99"],
-        float(np.median(np.asarray(vector_qps, dtype=np.float64))),
+        float(np.median(qps_values)),
+        float(np.min(qps_values)),
+        float(np.max(qps_values)),
+        qps_cv,
     )
 
 
 def test_vearch_index_hnsw_performance():
+    explicit_db_name = _env("DB_NAME", "").strip()
+    if (REUSE_INDEX or KEEP_INDEX) and not explicit_db_name:
+        raise ValueError(
+            "VEARCH_HNSW_PERF_DB_NAME (or VEARCH_PERF_DB_NAME) must be set "
+            "when KEEP_INDEX or REUSE_INDEX is enabled"
+        )
+    db_name = explicit_db_name or "ts_hnsw_perf_%d" % os.getpid()
+    space_name = _env("SPACE_NAME", "ts_hnsw_perf_space")
+
     dataset = DatasetSift1M()
-    vectors = dataset.get_database()
+    expected_count = dataset.nb
+    dimension = dataset.d
+    vectors = None
+    if not REUSE_INDEX:
+        vectors = dataset.get_database()
+        if vectors.shape != (expected_count, dimension):
+            raise AssertionError(
+                "database shape mismatch: actual=%s expected=(%d, %d)"
+                % (vectors.shape, expected_count, dimension)
+            )
     query_count = min(QUERY_COUNT, dataset.nq)
     query_vectors = dataset.get_queries()[:query_count]
     groundtruth = np.asarray(dataset.get_groundtruth()[:query_count])
-    db_name = _env("DB_NAME", "ts_hnsw_perf_%d" % os.getpid())
-    space_name = _env("SPACE_NAME", "ts_hnsw_perf_space")
 
     logger.info(
         "PERF CONFIG index=HNSW vectors=%d dimension=%d queries=%d top_k=%d "
         "modes=%s concurrency=%s warmup_rounds=%d trials=%d seconds=%.1f "
-        "nlinks=%d efConstruction=%d efSearch=%s latency_scope=http_send "
-        "trust_env=%s",
-        vectors.shape[0],
-        vectors.shape[1],
+        "nlinks=%d efConstruction=%d efSearch=%s "
+        "reuse_index=%s keep_index=%s reuse_warmup_seconds=%.1f "
+        "ready_consecutive_polls=%d latency_scope=http_send trust_env=%s",
+        expected_count,
+        dimension,
         query_count,
         TOP_K,
         ",".join(MODES),
@@ -485,17 +734,50 @@ def test_vearch_index_hnsw_performance():
         NLINKS,
         EF_CONSTRUCTION,
         "server-default" if EF_SEARCH < 0 else EF_SEARCH,
+        str(REUSE_INDEX).lower(),
+        str(KEEP_INDEX).lower(),
+        REUSE_WARMUP_SECONDS,
+        READY_CONSECUTIVE_POLLS,
         str(TRUST_ENV).lower(),
     )
 
     database_created = False
+    index_persisted = False
     try:
         started = time.perf_counter()
-        _create_hnsw_space(db_name, space_name, vectors.shape[1], dataset.metric)
-        database_created = True
-        _ingest(db_name, space_name, vectors)
-        _wait_for_index(db_name, space_name, vectors.shape[0])
-        logger.info("PERF SETUP total_ready_seconds=%.2f", time.perf_counter() - started)
+        if REUSE_INDEX:
+            _wait_for_index(
+                db_name,
+                space_name,
+                expected_count,
+                require_complete_at_start=True,
+            )
+            _validate_reusable_space(
+                db_name,
+                space_name,
+                expected_count,
+                dimension,
+                dataset.metric,
+                NLINKS,
+                EF_CONSTRUCTION,
+            )
+            logger.info(
+                "PERF SETUP index_source=reused total_ready_seconds=%.2f",
+                time.perf_counter() - started,
+            )
+        else:
+            _create_hnsw_space(db_name, space_name, dimension, dataset.metric)
+            database_created = True
+            _ingest(db_name, space_name, vectors)
+            _wait_for_index(db_name, space_name, expected_count)
+            if KEEP_INDEX:
+                _flush_retained_index(db_name, space_name)
+                index_persisted = True
+            logger.info(
+                "PERF SETUP index_source=built retained=%s total_ready_seconds=%.2f",
+                str(index_persisted).lower(),
+                time.perf_counter() - started,
+            )
         if SETTLE_SECONDS:
             time.sleep(SETTLE_SECONDS)
 
@@ -503,10 +785,29 @@ def test_vearch_index_hnsw_performance():
         batch_specs = _request_specs("batch", query_vectors, base_query)
         _verify_recall(batch_specs[0], groundtruth)
         for mode in MODES:
-            specs = batch_specs if mode == "batch" else _request_specs(mode, query_vectors, base_query)
+            specs = (
+                batch_specs
+                if mode == "batch"
+                else _request_specs(mode, query_vectors, base_query)
+            )
             vectors_per_request = query_count if mode == "batch" else 1
             for concurrency in CONCURRENCIES:
-                warmup_result = _run_warmup(specs, concurrency)
+                minimum_warmup_seconds = REUSE_WARMUP_SECONDS if REUSE_INDEX else 0
+                warmup_result = _run_warmup(
+                    specs,
+                    concurrency,
+                    minimum_seconds=minimum_warmup_seconds,
+                )
+                logger.info(
+                    "PERF WARMUP mode=%s concurrency=%d rounds=%d requests=%d "
+                    "elapsed_seconds=%.2f minimum_seconds=%.1f",
+                    mode,
+                    concurrency,
+                    warmup_result["rounds"],
+                    warmup_result["successes"],
+                    warmup_result["elapsed"],
+                    minimum_warmup_seconds,
+                )
                 if warmup_result["error_examples"]:
                     logger.error(
                         "benchmark warmup error examples: %s",
@@ -518,12 +819,22 @@ def test_vearch_index_hnsw_performance():
                 for trial_number in range(1, TRIALS + 1):
                     result = _run_trial(specs, concurrency)
                     trial_results.append(result)
-                    trial_qps.append(_log_trial(mode, concurrency, trial_number, result, vectors_per_request))
+                    trial_qps.append(
+                        _log_trial(
+                            mode,
+                            concurrency,
+                            trial_number,
+                            result,
+                            vectors_per_request,
+                        )
+                    )
                     if result["error_examples"]:
                         logger.error("benchmark error examples: %s", result["error_examples"])
                     assert result["errors"] == 0
                     assert result["successes"] > 0
                 _log_summary(mode, concurrency, trial_results, trial_qps)
     finally:
-        if database_created:
+        # Keep only a completely built and successfully flushed index. Failed
+        # setup must not leave a partial space that a later reuse run accepts.
+        if database_created and not index_persisted:
             destroy(router_url, db_name, space_name)

@@ -93,7 +93,7 @@ def process_add_data(items):
     for j in range(batch_size):
         param_dict = {}
         if with_id:
-            param_dict["_id"] = str(index * batch_size + j)
+            param_dict["_id"] = str(index * batch_size + j + offset)
         param_dict["field_int"] = (index * batch_size + j + offset) * seed
         if has_vector:
             param_dict["field_vector"] = features[j].tolist()
@@ -127,8 +127,9 @@ def add(
     db_name=db_name,
     space_name=space_name,
     offset=0,
+    max_workers=None,
 ):
-    pool = ThreadPool()
+    pool = ThreadPool(processes=max_workers)
     total_data = []
     for i in range(total):
         total_data.append(
