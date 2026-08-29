@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/cubefs/cubefs/depends/tiglabs/raft"
 	"github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
@@ -264,14 +265,36 @@ func (s *Server) PartitionNum() int {
 
 func (s *Server) ClosePartitions() {
 	log.Info("ClosePartitions() invoked...")
+	engines := make([]engine.Engine, 0)
 	s.partitions.Range(func(key, value any) bool {
 		partition := value.(PartitionStore)
+		partitionEngine := partition.GetEngine()
 		err := partition.Close()
 		if err != nil {
 			log.Error("ClosePartitions() partition close has err: [%v]", err)
+		} else if partitionEngine != nil {
+			engines = append(engines, partitionEngine)
 		}
 		return true
 	})
+
+	// gammaEngine.Close starts the native Gamma destructor asynchronously so
+	// that all partitions can close in parallel. Do not let the process exit
+	// until those destructors have joined their indexing threads and released
+	// the native engines.
+	pending := len(engines)
+	for pending > 0 {
+		pending = 0
+		for _, engine := range engines {
+			if !engine.HasClosed() {
+				pending++
+			}
+		}
+		if pending > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	log.Info("ClosePartitions() completed, engines closed: [%d]", len(engines))
 }
 
 func (s *Server) recoverPartitions(pids []entity.PartitionID, spaces []*entity.Space) {

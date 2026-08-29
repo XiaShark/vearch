@@ -20,6 +20,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 	"unsafe"
 
@@ -27,7 +28,7 @@ import (
 	"github.com/vearch/vearch/v3/internal/config"
 	"github.com/vearch/vearch/v3/internal/engine/sdk/go/gamma"
 	"github.com/vearch/vearch/v3/internal/entity"
-	"github.com/vearch/vearch/v3/internal/pkg/atomic"
+	vearchatomic "github.com/vearch/vearch/v3/internal/pkg/atomic"
 	"github.com/vearch/vearch/v3/internal/pkg/log"
 	json "github.com/vearch/vearch/v3/internal/pkg/vjson"
 	"github.com/vearch/vearch/v3/internal/proto/vearchpb"
@@ -95,8 +96,7 @@ func New(cfg EngineConfig) (engine.Engine, error) {
 		partitionID:  cfg.PartitionID,
 		path:         cfg.Path,
 		gamma:        engineInstance,
-		counter:      atomic.NewAtomicInt64(0),
-		hasClosed:    false,
+		counter:      vearchatomic.NewAtomicInt64(0),
 	}
 	ge.reader = &readerImpl{engine: ge}
 	ge.writer = &writerImpl{engine: ge}
@@ -141,9 +141,9 @@ type gammaEngine struct {
 	reader *readerImpl
 	writer *writerImpl
 
-	counter   *atomic.AtomicInt64
+	counter   *vearchatomic.AtomicInt64
 	lock      sync.RWMutex
-	hasClosed bool
+	hasClosed stdatomic.Bool
 }
 
 func (ge *gammaEngine) GetSpace() *entity.Space {
@@ -338,7 +338,7 @@ func (ge *gammaEngine) BuildIndex() error {
 	ge.counter.Incr()
 	defer ge.counter.Decr()
 	gammaEngine := ge.gamma
-	if gammaEngine == nil || ge.hasClosed {
+	if gammaEngine == nil || ge.HasClosed() {
 		log.Error("gammaEngine is nil or closed, partition:[%d]", ge.partitionID)
 		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED, nil)
 	}
@@ -421,12 +421,12 @@ func (ge *gammaEngine) Load() error {
 		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, fmt.Errorf("load data err code:[%d]", code))
 	}
 	ge.gamma = engineInstance
-	ge.hasClosed = false
+	ge.hasClosed.Store(false)
 	return nil
 }
 
 func (ge *gammaEngine) HasClosed() bool {
-	return ge.hasClosed
+	return ge.hasClosed.Load()
 }
 
 func (ge *gammaEngine) Close() {
@@ -441,6 +441,7 @@ func (ge *gammaEngine) Close() {
 	go func(enginePtr unsafe.Pointer) {
 		if enginePtr == nil {
 			log.Warn("gamma engine already closed, partition:[%d]", ge.partitionID)
+			ge.hasClosed.Store(true)
 			return
 		}
 
@@ -463,8 +464,8 @@ func (ge *gammaEngine) Close() {
 			log.Info("close gamma engine partition:[%d] success", ge.partitionID)
 		}
 
-		ge.hasClosed = true
 		log.Info("close gamma engine partition:[%d] end cost:[%v]", ge.partitionID, time.Since(start))
+		ge.hasClosed.Store(true)
 	}(enginePtr)
 }
 
@@ -502,7 +503,7 @@ func (ge *gammaEngine) getEnginePtr() (unsafe.Pointer, error) {
 	ge.lock.RLock()
 	defer ge.lock.RUnlock()
 
-	if ge.hasClosed {
+	if ge.HasClosed() {
 		return nil, vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED,
 			fmt.Errorf("engine is closed, partition:[%d]", ge.partitionID))
 	}

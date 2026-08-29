@@ -122,6 +122,7 @@ func main() {
 	logName := strings.ToUpper(strings.Join(args, "-"))
 	vearchlog.SetConfig(config.Conf().GetLogFileNum(), 1024*1024*config.Conf().GetLogFileSize())
 	log.Regist(vearchlog.NewVearchLog(config.Conf().GetLogDir(), logName, config.Conf().GetLevel(), false))
+	defer log.Flush()
 
 	log.Info("start server by version:[%s] commitID:[%s]", BuildVersion, CommitID)
 	log.Info("config file: %v", confPath)
