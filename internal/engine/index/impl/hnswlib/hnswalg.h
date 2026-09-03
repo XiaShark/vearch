@@ -31,6 +31,14 @@
 #include "util/log.h"
 #include "visited_list_pool.h"
 
+#ifndef HNSW_PREFETCH_DISTANCE
+#define HNSW_PREFETCH_DISTANCE 4
+#endif
+
+#if HNSW_PREFETCH_DISTANCE < 0
+#error "HNSW_PREFETCH_DISTANCE must be non-negative"
+#endif
+
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
@@ -185,6 +193,17 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
   virtual char *getDataByInternalId(tableint internal_id) const = 0;
 
+#if defined(USE_SVE) && HNSW_PREFETCH_DISTANCE > 0
+  inline void prefetchVectorData(char *data) const noexcept {
+    // Every accepted candidate is consumed in full by the distance function.
+    constexpr size_t cache_line_size = 64;
+    for (size_t offset = 0; offset < vec_data_size_;
+         offset += cache_line_size) {
+      __builtin_prefetch(data + offset, 0, 3);
+    }
+  }
+#endif
+
   int getRandomLevel(double reverse_size) {
     std::uniform_real_distribution<double> distribution(0.0, 1.0);
     double r = -log(distribution(level_generator_)) * reverse_size;
@@ -249,6 +268,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
       _mm_prefetch(getDataByInternalId(*datal), _MM_HINT_T0);
       _mm_prefetch(getDataByInternalId(*(datal + 1)), _MM_HINT_T0);
 #endif
+#ifdef USE_SVE
+      __builtin_prefetch(visited_array + *datal, 0, 3);
+      __builtin_prefetch(getDataByInternalId(*datal), 0, 3);
+#endif
 
       for (size_t j = 0; j < size; j++) {
         tableint candidate_id = *(datal + j);
@@ -256,6 +279,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 #ifdef USE_SSE
         _mm_prefetch((char *)(visited_array + *(datal + j + 1)), _MM_HINT_T0);
         _mm_prefetch(getDataByInternalId(*(datal + j + 1)), _MM_HINT_T0);
+#endif
+#if defined(USE_SVE) && HNSW_PREFETCH_DISTANCE > 0
+        tableint prefetch_id = *(datal + j + HNSW_PREFETCH_DISTANCE);
+        __builtin_prefetch(visited_array + prefetch_id, 0, 3);
+        __builtin_prefetch(getDataByInternalId(prefetch_id), 0, 3);
 #endif
         if (visited_array[candidate_id] == visited_array_tag) continue;
         visited_array[candidate_id] = visited_array_tag;
@@ -356,11 +384,52 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         metric_distance_computations += size;
       }
 
+      auto process_candidate = [&](tableint candidate_id, char *currObj1) {
+        dist_t dist = fstdistfunc(data_point, currObj1, dist_func_param_);
+
+        if (top_candidates.size() < ef || lowerBound > dist) {
+          candidate_set.emplace(-dist, candidate_id);
+#ifdef USE_SSE
+          _mm_prefetch(
+              getDataByInternalId(candidate_set.top().second),  ///////////
+              _MM_HINT_T0);  ////////////////////////
+#endif
+
+          if (!has_deletions || !isMarkedDeleted(candidate_id)) {
+            dist_t fixed_dist = dist;
+            if (retrieval_context->retrieval_params_->GetDistanceComputeType() ==
+                DistanceComputeType::INNER_PRODUCT) {
+              fixed_dist = 1 - fixed_dist;
+            }
+            if (retrieval_context->IsValid(candidate_id) &&
+                retrieval_context->IsSimilarScoreValid(fixed_dist)) {
+              top_candidates.emplace(dist, candidate_id);
+            }
+          }
+
+          if (top_candidates.size() > ef) top_candidates.pop();
+
+          if (!top_candidates.empty())
+            lowerBound = top_candidates.top().first;
+        }
+      };
+
+#if defined(USE_SVE) && HNSW_PREFETCH_DISTANCE > 0
+      struct PrefetchedCandidate {
+        tableint id;
+        char *data;
+      } prefetched[HNSW_PREFETCH_DISTANCE];
+      size_t prefetched_head = 0;
+      size_t prefetched_count = 0;
+#endif
 #ifdef USE_SSE
       _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
       _mm_prefetch((char *)(visited_array + *(data + 1) + 64), _MM_HINT_T0);
       _mm_prefetch(getDataByInternalId(*(data + 1)), _MM_HINT_T0);
       // _mm_prefetch((char *)(data + 2), _MM_HINT_T0);
+#endif
+#ifdef USE_SVE
+      __builtin_prefetch(visited_array + *(data + 1), 0, 3);
 #endif
 
       for (size_t j = 1; j <= size; j++) {
@@ -371,40 +440,42 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         _mm_prefetch(getDataByInternalId(*(data + j + 1)),
                      _MM_HINT_T0);  ////////////
 #endif
+#if defined(USE_SVE) && HNSW_PREFETCH_DISTANCE > 0
+        int prefetch_id = *(data + j + HNSW_PREFETCH_DISTANCE);
+        __builtin_prefetch(visited_array + prefetch_id, 0, 3);
+#endif
         if (!(visited_array[candidate_id] == visited_array_tag)) {
           visited_array[candidate_id] = visited_array_tag;
-
-          char *currObj1 = (getDataByInternalId(candidate_id));
-          dist_t dist = fstdistfunc(data_point, currObj1, dist_func_param_);
-
-          if (top_candidates.size() < ef || lowerBound > dist) {
-            candidate_set.emplace(-dist, candidate_id);
-#ifdef USE_SSE
-            _mm_prefetch(
-                getDataByInternalId(candidate_set.top().second),  ///////////
-                _MM_HINT_T0);  ////////////////////////
-#endif
-
-            if (!has_deletions || !isMarkedDeleted(candidate_id)) {
-              dist_t fixed_dist = dist;
-              if (retrieval_context->retrieval_params_
-                      ->GetDistanceComputeType() ==
-                  DistanceComputeType::INNER_PRODUCT) {
-                fixed_dist = 1 - fixed_dist;
-              }
-              if (retrieval_context->IsValid(candidate_id) &&
-                  retrieval_context->IsSimilarScoreValid(fixed_dist)) {
-                top_candidates.emplace(dist, candidate_id);
-              }
-            }
-
-            if (top_candidates.size() > ef) top_candidates.pop();
-
-            if (!top_candidates.empty())
-              lowerBound = top_candidates.top().first;
+#if defined(USE_SVE) && HNSW_PREFETCH_DISTANCE > 0
+          char *candidate_data = getDataByInternalId(candidate_id);
+          prefetchVectorData(candidate_data);
+          if (prefetched_count == HNSW_PREFETCH_DISTANCE) {
+            PrefetchedCandidate ready = prefetched[prefetched_head];
+            prefetched[prefetched_head] = {
+                static_cast<tableint>(candidate_id), candidate_data};
+            prefetched_head =
+                (prefetched_head + 1) % HNSW_PREFETCH_DISTANCE;
+            process_candidate(ready.id, ready.data);
+          } else {
+            size_t tail = (prefetched_head + prefetched_count) %
+                          HNSW_PREFETCH_DISTANCE;
+            prefetched[tail] = {static_cast<tableint>(candidate_id),
+                                candidate_data};
+            ++prefetched_count;
           }
+#else
+          process_candidate(candidate_id, getDataByInternalId(candidate_id));
+#endif
         }
       }
+#if defined(USE_SVE) && HNSW_PREFETCH_DISTANCE > 0
+      while (prefetched_count > 0) {
+        PrefetchedCandidate ready = prefetched[prefetched_head];
+        prefetched_head = (prefetched_head + 1) % HNSW_PREFETCH_DISTANCE;
+        --prefetched_count;
+        process_candidate(ready.id, ready.data);
+      }
+#endif
       nstep++;
       if (do_efSearch_check && nstep > efSearch) {
         break;
@@ -1017,9 +1088,17 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 #ifdef USE_SSE
           _mm_prefetch(getDataByInternalId(*datal), _MM_HINT_T0);
 #endif
+#ifdef USE_SVE
+          __builtin_prefetch(getDataByInternalId(*datal), 0, 3);
+#endif
           for (int i = 0; i < size; i++) {
 #ifdef USE_SSE
             _mm_prefetch(getDataByInternalId(*(datal + i + 1)), _MM_HINT_T0);
+#endif
+#if defined(USE_SVE) && HNSW_PREFETCH_DISTANCE > 0
+            __builtin_prefetch(
+                getDataByInternalId(*(datal + i + HNSW_PREFETCH_DISTANCE)), 0,
+                3);
 #endif
             tableint cand = datal[i];
             dist_t d = fstdistfunc_(dataPoint, getDataByInternalId(cand),
@@ -1221,6 +1300,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
         tableint *datal = (tableint *)(data + 1);
         for (int i = 0; i < size; i++) {
+#if defined(USE_SVE) && HNSW_PREFETCH_DISTANCE > 0
+          __builtin_prefetch(
+              getDataByInternalId(*(datal + i + HNSW_PREFETCH_DISTANCE)), 0,
+              3);
+#endif
           tableint cand = datal[i];
           if (cand < 0 || cand > max_elements_)
             throw std::runtime_error("cand error");

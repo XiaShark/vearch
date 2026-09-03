@@ -18,6 +18,9 @@
 
 #pragma once
 #ifndef NO_MANUAL_VECTORIZATION
+#ifdef __ARM_FEATURE_SVE
+#define USE_SVE
+#endif
 #ifdef __SSE__
 #define USE_SSE
 #ifdef __AVX__
@@ -27,6 +30,10 @@
 #endif
 #endif
 #endif
+#endif
+
+#if defined(USE_SVE)
+#include <arm_sve.h>
 #endif
 
 #if defined(USE_AVX) || defined(USE_SSE)
