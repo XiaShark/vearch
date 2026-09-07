@@ -123,8 +123,8 @@ function build_engine() {
     -DCMAKE_CXX_COMPILER=clang++
     -DCMAKE_C_FLAGS="-flto=thin -g -ffast-math"
     -DCMAKE_CXX_FLAGS="-flto=thin -g -ffast-math"
-    -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -flto=thin"
-    -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -flto=thin"
+    -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -flto=thin -ljemalloc"
+    -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -flto=thin -ljemalloc"
   )
   cmake "${cmake_opts[@]}" -DCMAKE_BUILD_RPATH="$rpath" -DCMAKE_INSTALL_RPATH="\$ORIGIN" -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF $ROOT/internal/engine/
   make $COMPILE_THREAD_NUM
@@ -137,7 +137,8 @@ function build_vearch() {
   echo "version info: $flags"
   export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$GAMMAOUT
   export LIBRARY_PATH=$LIBRARY_PATH:$GAMMAOUT
-  export CGO_LDFLAGS="${CGO_LDFLAGS}"
+  # Keep jemalloc ahead of libc in the executable's dependency lookup order.
+  export CGO_LDFLAGS="-Wl,--push-state,--no-as-needed -ljemalloc -Wl,--pop-state ${CGO_LDFLAGS}"
 
   echo "build vearch"
   go build -a -tags="vector" -ldflags "$flags" -o $BUILDOUT/vearch $ROOT/cmd/vearch/startup.go
